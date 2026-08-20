@@ -1,18 +1,19 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.jetbrains.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.heymeowcat.sounddrift"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.heymeowcat.sounddrift"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.4"
+        targetSdk = 36
+        versionCode = 3
+        versionName = "1.1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -39,9 +40,6 @@ android {
     }
     buildFeatures {
         compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.1"
     }
     packaging {
         resources {
