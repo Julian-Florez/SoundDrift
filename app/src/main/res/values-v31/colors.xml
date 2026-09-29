@@ -1,0 +1,4 @@
+<resources>
+    <color name="launcher_background">@android:color/system_neutral2_800</color>
+    <color name="launcher_foreground">@android:color/system_accent2_200</color>
+</resources>

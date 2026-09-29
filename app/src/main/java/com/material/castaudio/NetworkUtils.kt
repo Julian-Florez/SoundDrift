@@ -1,4 +1,4 @@
-package com.heymeowcat.sounddrift
+package com.material.castaudio
 
 import java.net.InetAddress
 import java.net.NetworkInterface

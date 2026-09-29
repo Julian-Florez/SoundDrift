@@ -1,4 +1,4 @@
-package com.heymeowcat.sounddrift.ui.theme
+package com.material.castaudio.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

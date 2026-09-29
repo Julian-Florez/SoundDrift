@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.heymeowcat.sounddrift"
+    namespace = "com.material.castaudio"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.heymeowcat.sounddrift"
+        applicationId = "com.material.castaudio"
         minSdk = 26
         targetSdk = 36
         versionCode = 3

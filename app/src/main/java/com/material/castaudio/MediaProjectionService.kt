@@ -1,4 +1,4 @@
-package com.heymeowcat.sounddrift
+package com.material.castaudio
 
 import android.Manifest
 import android.app.*
@@ -14,16 +14,14 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
-import org.json.JSONException
 import org.json.JSONObject
-import java.io.ObjectOutputStream
 import java.io.PrintWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.ServerSocket
-import java.net.SocketTimeoutException
-import java.nio.charset.StandardCharsets
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -35,28 +33,33 @@ class MediaProjectionService : Service() {
     private var audioRecord: AudioRecord? = null
     private var deviceAudioRecord: AudioRecord? = null
     private var recordingJob: Job? = null
-    private var connectionMonitorJob: Job? = null
-    private var discoveryJob: Job? = null
-    private var udpServerJob: Job? = null
+    private var connectionJob: Job? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val binder = LocalBinder()
     private var isMicEnabled = AtomicBoolean(false)
     private var isDeviceAudioEnabled = AtomicBoolean(false)
-    private var rtpSocket: DatagramSocket? = null
-    private var tcpServer: ServerSocket? = null
+    private var audioSocket: DatagramSocket? = null
+    @Volatile private var pcSocket: Socket? = null
+    @Volatile private var pcAddress: java.net.InetAddress? = null
+    @Volatile private var isPcConnected = false
+    private val metadataLock = Any()
+    private var streamingWakeLock: PowerManager.WakeLock? = null
     private var tcpWriter: PrintWriter? = null
     private var micVolume = 1f
     private var deviceVolume = 1f
     private var connectedClientIP: String = ""
     private var connectedClientDeviceName: String = ""
     private var lastPacketTime = AtomicLong(0L)
-    private val CONNECTION_TIMEOUT = 5000L
+    private val pcHost = "nixos.tail1e673a.ts.net"
+    private val pcTcpPort = 55557
+    private val pcUdpPort = 55555
 
     private val latencyMeasurements = ConcurrentLinkedQueue<Long>()
     private var maxLatency = 0L
 
     private val CHANNEL_ID = "SoundDriftServiceChannel"
     private val NOTIFICATION_ID = 1
-    private val ACTION_STOP = "com.heymeowcat.sounddrift.STOP_STREAMING"
+    private val ACTION_STOP = "com.material.castaudio.STOP_STREAMING"
     private val sampleRate = 44100
     private val channelConfig = AudioFormat.CHANNEL_IN_STEREO
     private val bufferSize = AudioRecord.getMinBufferSize(
@@ -103,7 +106,9 @@ class MediaProjectionService : Service() {
                 put("isMicEnabled", isMicEnabled.get())
                 put("isDeviceAudioEnabled", isDeviceAudioEnabled.get())
             }
-            tcpWriter?.println(metadata.toString())
+            synchronized(metadataLock) {
+                tcpWriter?.println(metadata.toString())
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -123,248 +128,54 @@ class MediaProjectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startServers()
+        startPcConnectionLoop()
     }
 
-    private fun startServers() {
-
-        var tempConnectedDeviceName=""
-        // Start TCP Server
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val tcpServer = ServerSocket(55557)
-                println("TCP Server started on port 55557")
-
-                while (isActive) {
-                    val client = tcpServer.accept()
-                    println("TCP Client connected from: ${client.inetAddress.hostAddress}")
-                    connectedClientDeviceName = tempConnectedDeviceName
-
-                    tcpWriter = PrintWriter(client.getOutputStream(), true)
-
-                    // coroutine to handle the client connection
-                    launch {
-                        val tcpReader = client.getInputStream().bufferedReader()
-                        try {
-                            sendMetadata()
-                            // Loop to keep checking client connection
-                            while (isActive && !client.isClosed) {
-                                val message = tcpReader.readLine()
-                                if (message == null) {
-                                    println("TCP Client disconnected")
-                                    connectedClientDeviceName = "";
-                                    break
-                                }
-                                println("Received message from client: $message")
-                            }
-                        } catch (e: Exception) {
-                            println("Error with client connection: ${e.message}")
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        // Start UDP Server
-        udpServerJob = CoroutineScope(Dispatchers.IO).launch {
-            try {
-                rtpSocket = DatagramSocket(55556)
-                println("UDP Server started on port 55556")
-                startConnectionMonitoring()
-
-                while (isActive) {
-                    val receiveBuffer = ByteArray(1024)
-                    val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
-
-                    println("Waiting for client connection...")
-                    connectedClientIP = ""
-                    connectedClientDeviceName = ""
-
-                    // Don't stop recording here, it might be running from a previous session or we want to keep it ready
-                    // stopAudioRecording() 
-
-                    // Receive the initial connection packet
-                    try {
-                        rtpSocket?.receive(receivePacket)
-                    } catch (e: Exception) {
-                        if (isActive) {
-                            println("UDP Receive error: ${e.message}")
-                            delay(1000)
-                        }
-                        continue
-                    }
-
-                    val receivedMessage = String(receivePacket.data, 0, receivePacket.length, StandardCharsets.UTF_8)
-                    println("UDP received: '$receivedMessage' from ${receivePacket.address.hostAddress}:${receivePacket.port}")
-
-                    if (receivedMessage.contains("SoundDriftDisconnect")) {
-                         println("Received disconnect packet, ignoring as we are already waiting.")
-                         continue
-                    }
-
-                    // New Single-Packet Handshake Logic
-                    if (receivedMessage.startsWith("SoundDriftConnectionRequest")) {
-                        // Only accept connections if streaming is actually enabled
-                        if (!isMicEnabled.get() && !isDeviceAudioEnabled.get()) {
-                            println("Ignoring connection request - streaming is not enabled")
-                            continue
-                        }
-                        
-                        val parts = receivedMessage.split("|")
-                        if (parts.size >= 2) {
-                            val jsonString = parts.subList(1, parts.size).joinToString("|")
-                            try {
-                                val deviceInfo = JSONObject(jsonString)
-                                val newDeviceName = deviceInfo.getString("deviceName")
-                                val newClientIP = receivePacket.address.hostAddress ?: ""
-                                
-                                // Allow reconnection from same or different client
-                                if (connectedClientIP.isNotEmpty() && connectedClientIP != newClientIP) {
-                                    println("New client connecting, disconnecting previous: $connectedClientIP")
-                                }
-                                
-                                connectedClientDeviceName = newDeviceName
-                                tempConnectedDeviceName = connectedClientDeviceName
-                                connectedClientIP = newClientIP
-                                lastPacketTime.set(System.currentTimeMillis()) // Reset timeout on new handshake
-                                
-                                println("Device Name: $connectedClientDeviceName, IP: $connectedClientIP")
-                                println("Handshake complete. Starting stream to $connectedClientIP")
-                                
-                                withContext(Dispatchers.Main) {
-                                    updateAudioRecording()
-                                }
-                                
-                                // Set socket timeout so we don't block forever
-                                rtpSocket?.soTimeout = 3000 // 3 second timeout
-                                
-                                // Wait for disconnect, timeout, or new connection
-                                while (isActive && connectedClientIP.isNotEmpty()) {
-                                    val buffer = ByteArray(1024)
-                                    val packet = DatagramPacket(buffer, buffer.size)
-                                    try {
-                                        rtpSocket?.receive(packet)
-                                        val msg = String(packet.data, 0, packet.length, StandardCharsets.UTF_8)
-                                        
-                                        if (msg.contains("SoundDriftDisconnect")) {
-                                            println("Client requested disconnect")
-                                            connectedClientIP = ""
-                                            break
-                                        } else if (msg.startsWith("SoundDriftConnectionRequest")) {
-                                            // New connection request - break to handle it in outer loop
-                                            println("New connection request received, reprocessing...")
-                                            // Put this packet back by setting receivedMessage
-                                            connectedClientIP = "" // Clear to break
-                                            // We'll handle the new request in the next iteration
-                                            break
-                                        }
-                                    } catch (e: java.net.SocketTimeoutException) {
-                                        // Check if connection is still valid
-                                        val timeSinceLastPacket = System.currentTimeMillis() - lastPacketTime.get()
-                                        if (timeSinceLastPacket > CONNECTION_TIMEOUT) {
-                                            println("Connection timed out (no activity for ${CONNECTION_TIMEOUT}ms)")
-                                            connectedClientIP = ""
-                                            break
-                                        }
-                                        // Otherwise continue waiting
-                                    } catch (e: Exception) {
-                                        if (!isActive) break
-                                        println("Error in connection loop: ${e.message}")
-                                    }
-                                }
-                                
-                                // Reset socket timeout for main receive
-                                rtpSocket?.soTimeout = 0
-                                
-                            } catch (e: JSONException) {
-                                println("Invalid JSON in handshake: ${e.message}")
-                                connectedClientIP = ""
-                            }
-                        } else {
-                            println("Received connection header but missing JSON payload.")
-                        }
-                    } else {
-                        println("Ignoring unknown packet: $receivedMessage")
-                    }
-
-                    println("Session ended for $connectedClientIP")
-                    connectedClientIP = ""
-                    connectedClientDeviceName = ""
-                    lastPacketTime.set(0)
-                }
-
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        startDiscoveryListener()
-    }
-
-    private fun startDiscoveryListener() {
-        discoveryJob = CoroutineScope(Dispatchers.IO).launch {
-            var discoverySocket: DatagramSocket? = null
-            try {
-                discoverySocket = DatagramSocket(55558)
-                discoverySocket.broadcast = true
-                println("Discovery listener started on port 55558")
-
-                val buffer = ByteArray(1024)
-                while (isActive) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    try {
-                        discoverySocket.receive(packet)
-                        val message = String(packet.data, 0, packet.length, StandardCharsets.UTF_8)
-
-                        if (message == "SoundDriftDiscovery") {
-                             println("Discovery probe received from ${packet.address.hostAddress}")
-
-                             // Only respond if we are actually checking/ready to stream
-                             if (isMicEnabled.get() || isDeviceAudioEnabled.get()) {
-                                 val responseJson = JSONObject().apply {
-                                     put("deviceName", Build.MODEL)
-                                     put("ip", NetworkUtils.getIPAddress(true)) // We need a helper for IP
-                                     put("type", "android-host")
-                                 }
-    
-                                 val responseData = responseJson.toString().toByteArray(StandardCharsets.UTF_8)
-                                 val responsePacket = DatagramPacket(
-                                     responseData,
-                                     responseData.size,
-                                     packet.address,
-                                     packet.port
-                                 )
-                                 discoverySocket.send(responsePacket)
-                                 println("Discovery response sent to ${packet.address.hostAddress}:${packet.port}")
-                             }
-                        }
-                    } catch (e: Exception) {
-                        println("Error in discovery loop: ${e.message}")
-                    }
-                }
-            } catch (e: Exception) {
-                println("Could not bind discovery socket: ${e.message}")
-            } finally {
-                discoverySocket?.close()
-            }
-        }
-    }
-
-    private fun startConnectionMonitoring() {
-        connectionMonitorJob?.cancel()
-        connectionMonitorJob = CoroutineScope(Dispatchers.IO).launch {
+    private fun startPcConnectionLoop() {
+        if (connectionJob?.isActive == true) return
+        connectionJob = serviceScope.launch {
             while (isActive) {
-                if (connectedClientIP.isNotEmpty()) {
-                    val timeSinceLastPacket = System.currentTimeMillis() - lastPacketTime.get()
-                    if (timeSinceLastPacket > CONNECTION_TIMEOUT) {
-                        println("Client connection timed out")
-                        connectedClientIP = ""
-                        stopAudioRecording()
+                val socket = Socket()
+                try {
+                    val pcIpv4 = InetAddress.getAllByName(pcHost)
+                        .firstOrNull { it is Inet4Address }
+                        ?: throw IllegalStateException("$pcHost no tiene una dirección IPv4 de Tailscale")
+                    socket.tcpNoDelay = true
+                    socket.keepAlive = true
+                    socket.connect(InetSocketAddress(pcIpv4, pcTcpPort), 5000)
+
+                    pcSocket = socket
+                    pcAddress = socket.inetAddress
+                    audioSocket = DatagramSocket()
+                    tcpWriter = PrintWriter(socket.getOutputStream(), true)
+                    connectedClientIP = socket.inetAddress.hostAddress ?: pcHost
+                    connectedClientDeviceName = pcHost
+                    isPcConnected = true
+                    println("Connected to $pcHost:$pcTcpPort")
+                    sendMetadata()
+
+                    val reader = socket.getInputStream().bufferedReader()
+                    while (isActive && !socket.isClosed) {
+                        if (reader.readLine() == null) break
                     }
+                    println("PC connection closed")
+                } catch (e: Exception) {
+                    if (isActive) println("PC connection failed: ${e.message}; retrying")
+                } finally {
+                    isPcConnected = false
+                    connectedClientIP = ""
+                    connectedClientDeviceName = ""
+                    pcAddress = null
+                    synchronized(metadataLock) {
+                        tcpWriter?.close()
+                        tcpWriter = null
+                    }
+                    audioSocket?.close()
+                    audioSocket = null
+                    if (pcSocket === socket) pcSocket = null
+                    runCatching { socket.close() }
                 }
-                delay(1000)
+                delay(2000)
             }
         }
     }
@@ -373,6 +184,10 @@ class MediaProjectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Handle stop action from notification
         if (intent?.action == ACTION_STOP) {
+            getSharedPreferences("CastAudio", MODE_PRIVATE)
+                .edit()
+                .putBoolean("resume_after_boot", false)
+                .apply()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -382,11 +197,24 @@ class MediaProjectionService : Service() {
 
         if (resultCode != 0 && data != null) {
             startForegroundService()
+            acquireStreamingWakeLock()
             startMediaProjection(resultCode, data)
         } else if (intent?.action != ACTION_STOP) {
             stopSelf()
         }
         return START_STICKY
+    }
+
+    private fun acquireStreamingWakeLock() {
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        if (streamingWakeLock?.isHeld == true) return
+        streamingWakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "$packageName:AudioStreaming"
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
     }
 
     private fun startForegroundService() {
@@ -409,8 +237,8 @@ class MediaProjectionService : Service() {
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("SoundDrift")
-            .setContentText("Streaming audio...")
+            .setContentTitle("Enviar Audio")
+            .setContentText("Transmitiendo; reconectando a $pcHost")
             .setSmallIcon(R.drawable.ic_stat_name)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setColor(ContextCompat.getColor(this, R.color.BlueGrey))
@@ -465,7 +293,7 @@ class MediaProjectionService : Service() {
             var packetCount = 0L
 
             try {
-                while (isActive && connectedClientIP.isNotEmpty()) {
+                while (isActive) {
                     val startTime = System.nanoTime()
                     var totalSize = 0
 
@@ -499,33 +327,27 @@ class MediaProjectionService : Service() {
                         }
                     }
 
-                    if (totalSize > 0) {
-                        println("startAudioStreaming() - connectedClientIP: $connectedClientIP")
+                    if (totalSize > 0 && isPcConnected) {
                         try {
-                            val packet = DatagramPacket(
-                                mixBuffer,
-                                totalSize,
-                                InetAddress.getByName(connectedClientIP),
-                                55555
-                            )
-                            rtpSocket?.send(packet)
+                            val targetAddress = pcAddress
+                            val socket = audioSocket
+                            if (isPcConnected && targetAddress != null && socket != null) {
+                                socket.send(DatagramPacket(mixBuffer, totalSize, targetAddress, pcUdpPort))
+                                lastPacketTime.set(System.currentTimeMillis())
+                            }
 
                             // Calculate and update latency
                             val endTime = System.nanoTime()
                             val latency = (endTime - startTime) / 1_000_000 // Convert to ms
                             updateLatencyMetrics(latency)
 
-                            lastPacketTime.set(System.currentTimeMillis())
                             packetCount++
 
                             if (packetCount % 100 == 0L) {
-                                println("Sent packet #$packetCount, size: $totalSize bytes")
                                 sendMetadata() // Update client with latest metrics periodically
                             }
                         } catch (e: Exception) {
                             println("Error sending audio packet: ${e.message}")
-                            connectedClientIP = ""
-                            break
                         }
                     } else {
                         delay(10)
@@ -688,18 +510,27 @@ class MediaProjectionService : Service() {
     }
 
     override fun onDestroy() {
-        connectionMonitorJob?.cancel()
-        discoveryJob?.cancel()
-        udpServerJob?.cancel()
+        connectionJob?.cancel()
+        serviceScope.cancel()
         isMicEnabled.set(false)
         isDeviceAudioEnabled.set(false)
         stopAudioRecording()
         mediaProjection?.stop()
         mediaProjection = null
-        rtpSocket?.close()
-        tcpWriter?.close()
-        tcpServer?.close()
-        tcpServer = null
+        isPcConnected = false
+        pcSocket?.close()
+        pcSocket = null
+        audioSocket?.close()
+        audioSocket = null
+        synchronized(metadataLock) {
+            tcpWriter?.close()
+            tcpWriter = null
+        }
+        pcAddress = null
+        streamingWakeLock?.let { lock ->
+            if (lock.isHeld) lock.release()
+        }
+        streamingWakeLock = null
         latencyMeasurements.clear()
         super.onDestroy()
     }

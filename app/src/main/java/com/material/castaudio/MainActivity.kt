@@ -1,4 +1,4 @@
-package com.heymeowcat.sounddrift
+package com.material.castaudio
 
 import android.Manifest
 import android.content.ComponentName
@@ -9,6 +9,10 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.os.IBinder
+import android.os.Build
+import android.provider.Settings
+import android.net.Uri
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -22,7 +26,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.heymeowcat.sounddrift.ui.theme.SoundDriftTheme
+import com.material.castaudio.ui.theme.SoundDriftTheme
 import kotlinx.coroutines.*
 
 import androidx.compose.ui.graphics.Color
@@ -42,6 +46,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:$packageName")
+                        }
+                    )
+                }
+            }
+        }
 
         audioStreamer = AudioStreamer(this)
 
@@ -180,30 +197,35 @@ private var _Volume_mute: ImageVector? = null
 
 
 class AudioStreamer(private val activity: ComponentActivity) {
+    private val preferences = activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
     private var mediaProjectionService: MediaProjectionService? = null
     private var _connectionStatus = mutableStateOf("")
     val connectionStatus = _connectionStatus as State<String>
     private var updateJob: Job? = null
 
-    private var _isMicEnabled = mutableStateOf(false)
-    private var _isDeviceAudioEnabled = mutableStateOf(false)
+    private var _isMicEnabled = mutableStateOf(preferences.getBoolean("mic_enabled", false))
+    private var _isDeviceAudioEnabled = mutableStateOf(preferences.getBoolean("device_audio_enabled", true))
     private var _isStreaming = mutableStateOf(false)
     val isMicEnabled = _isMicEnabled as State<Boolean>
     val isDeviceAudioEnabled = _isDeviceAudioEnabled as State<Boolean>
     val isStreaming = _isStreaming as State<Boolean>
 
-    private var _micVolume = mutableFloatStateOf(1f)
-    private var _deviceVolume = mutableFloatStateOf(1f)
+    private var _micVolume = mutableFloatStateOf(preferences.getFloat("mic_volume", 1f))
+    private var _deviceVolume = mutableFloatStateOf(preferences.getFloat("device_volume", 1f))
     val micVolume = _micVolume as State<Float>
     val deviceVolume = _deviceVolume as State<Float>
 
     fun setMicVolume(volume: Float) {
         _micVolume.floatValue = volume
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putFloat("mic_volume", volume).apply()
         mediaProjectionService?.setMicVolume(volume)
     }
 
     fun setDeviceVolume(volume: Float) {
         _deviceVolume.floatValue = volume
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putFloat("device_volume", volume).apply()
         mediaProjectionService?.setDeviceVolume(volume)
     }
 
@@ -262,17 +284,29 @@ class AudioStreamer(private val activity: ComponentActivity) {
 
     fun setMicEnabled(enabled: Boolean) {
         _isMicEnabled.value = enabled
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean("mic_enabled", enabled).apply()
         mediaProjectionService?.setMicEnabled(enabled)
     }
 
     fun setDeviceAudioEnabled(enabled: Boolean) {
         _isDeviceAudioEnabled.value = enabled
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean("device_audio_enabled", enabled).apply()
         mediaProjectionService?.setDeviceAudioEnabled(enabled)
     }
 
     private var isBound = false
 
     fun startProjection(resultCode: Int, data: Intent) {
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(CastAudioSettings.RESUME_AFTER_BOOT, true)
+            .putBoolean("mic_enabled", _isMicEnabled.value)
+            .putBoolean("device_audio_enabled", _isDeviceAudioEnabled.value)
+            .putFloat("mic_volume", _micVolume.floatValue)
+            .putFloat("device_volume", _deviceVolume.floatValue)
+            .apply()
         val serviceIntent = Intent(activity, MediaProjectionService::class.java).apply {
             putExtra("resultCode", resultCode)
             putExtra("data", data)
@@ -320,6 +354,8 @@ class AudioStreamer(private val activity: ComponentActivity) {
 
     fun stopStreaming() {
         if (_isStreaming.value) {
+            activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(CastAudioSettings.RESUME_AFTER_BOOT, false).apply()
             try {
                 activity.unbindService(serviceConnection)
             } catch (e: Exception) {
@@ -368,6 +404,32 @@ fun MainScreen(
         }
     }
 
+    val requestProjection = {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            projectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+        } else {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        requestProjection()
+    }
+
+    LaunchedEffect(Unit) {
+        val activity = context as? MainActivity
+        if (activity?.intent?.action == CastAudioSettings.ACTION_RESUME_AFTER_BOOT) {
+            activity.intent = activity.intent.apply { action = null }
+            requestProjection()
+        }
+    }
+
     var micSliderPosition by remember { mutableFloatStateOf(audioStreamer.micVolume.value) }
     var deviceSliderPosition by remember { mutableFloatStateOf(audioStreamer.deviceVolume.value) }
 
@@ -380,7 +442,7 @@ fun MainScreen(
     ) {
 
         Text(
-            text = "Sound Drift",
+            text = "Enviar Audio",
             style = MaterialTheme.typography.labelLarge.copy(
                 fontWeight = FontWeight.Bold,
                 fontSize = 24.sp
@@ -492,14 +554,15 @@ fun MainScreen(
                 Button(
                     onClick = {
                         if (!isStreaming) {
-                            if (ContextCompat.checkSelfPermission(
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(
                                     context,
-                                    Manifest.permission.RECORD_AUDIO
-                                ) == PackageManager.PERMISSION_GRANTED
+                                    Manifest.permission.POST_NOTIFICATIONS
+                                ) != PackageManager.PERMISSION_GRANTED
                             ) {
-                                projectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
-                                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                requestProjection()
                             }
                         } else {
                             audioStreamer.stopStreaming()
