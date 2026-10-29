@@ -203,8 +203,8 @@ class AudioStreamer(private val activity: ComponentActivity) {
     val connectionStatus = _connectionStatus as State<String>
     private var updateJob: Job? = null
 
-    private var _isMicEnabled = mutableStateOf(preferences.getBoolean("mic_enabled", false))
-    private var _isDeviceAudioEnabled = mutableStateOf(preferences.getBoolean("device_audio_enabled", true))
+    private var _isMicEnabled = mutableStateOf(false)
+    private var _isDeviceAudioEnabled = mutableStateOf(true)
     private var _isStreaming = mutableStateOf(false)
     val isMicEnabled = _isMicEnabled as State<Boolean>
     val isDeviceAudioEnabled = _isDeviceAudioEnabled as State<Boolean>
@@ -272,10 +272,10 @@ class AudioStreamer(private val activity: ComponentActivity) {
                 val clientIP = mediaProjectionService?.getConnectedClientIP() ?: ""
                 val clientDeviceName = mediaProjectionService?.getConnectedClientDeviceName() ?: ""
 
-                _connectionStatus.value = if (clientIP.isNotEmpty() &&clientDeviceName.isNotEmpty()) {
-                    "Streaming active \n$clientDeviceName \n($clientIP connected)"
+                _connectionStatus.value = if (clientIP.isNotEmpty() && clientDeviceName.isNotEmpty()) {
+                    "Conectado a este computador ($clientIP)"
                 } else {
-                    "Streaming active \n(waiting for connection...)"
+                    "Conectando a nixos.tail1e673a.ts.net…"
                 }
                 delay(1000) // Update every second
             }
@@ -296,9 +296,43 @@ class AudioStreamer(private val activity: ComponentActivity) {
         mediaProjectionService?.setDeviceAudioEnabled(enabled)
     }
 
+    fun useDeviceAudioOnly() {
+        _isMicEnabled.value = false
+        _isDeviceAudioEnabled.value = true
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("mic_enabled", false)
+            .putBoolean("device_audio_enabled", true)
+            .apply()
+    }
+
     private var isBound = false
 
+    fun startDirectStreaming() {
+        useDeviceAudioOnly()
+        activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(CastAudioSettings.RESUME_AFTER_BOOT, true)
+            .putBoolean("mic_enabled", _isMicEnabled.value)
+            .putBoolean("device_audio_enabled", _isDeviceAudioEnabled.value)
+            .putFloat("mic_volume", _micVolume.floatValue)
+            .putFloat("device_volume", _deviceVolume.floatValue)
+            .apply()
+        val serviceIntent = Intent(activity, MediaProjectionService::class.java).apply {
+            action = MediaProjectionService.ACTION_START_DIRECT
+        }
+
+        activity.startForegroundService(serviceIntent)
+        activity.bindService(
+            Intent(activity, MediaProjectionService::class.java),
+            serviceConnection,
+            Context.BIND_AUTO_CREATE
+        )
+        isBound = true
+    }
+
     fun startProjection(resultCode: Int, data: Intent) {
+        useDeviceAudioOnly()
         activity.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(CastAudioSettings.RESUME_AFTER_BOOT, true)
@@ -378,8 +412,6 @@ fun MainScreen(
 ) {
     val context = LocalContext.current
     val connectionStatus by audioStreamer.connectionStatus
-    val isMicEnabled by audioStreamer.isMicEnabled
-    val isDeviceAudioEnabled by audioStreamer.isDeviceAudioEnabled
     val isStreaming by audioStreamer.isStreaming
 
     val mediaProjectionManager = remember {
@@ -399,7 +431,7 @@ fun MainScreen(
     val audioPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
-        if (isGranted && (isMicEnabled || isDeviceAudioEnabled)) {
+        if (isGranted) {
             projectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
         }
     }
@@ -422,196 +454,99 @@ fun MainScreen(
         requestProjection()
     }
 
-    LaunchedEffect(Unit) {
-        val activity = context as? MainActivity
-        if (activity?.intent?.action == CastAudioSettings.ACTION_RESUME_AFTER_BOOT) {
-            activity.intent = activity.intent.apply { action = null }
+    val hasPrivilegedCapture = ContextCompat.checkSelfPermission(
+        context,
+        "android.permission.MODIFY_AUDIO_ROUTING"
+    ) == PackageManager.PERMISSION_GRANTED || ContextCompat.checkSelfPermission(
+        context,
+        "android.permission.CAPTURE_AUDIO_OUTPUT"
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val startStreamingAction = {
+        if (hasPrivilegedCapture) {
+            audioStreamer.startDirectStreaming()
+        } else {
             requestProjection()
         }
     }
 
-    var micSliderPosition by remember { mutableFloatStateOf(audioStreamer.micVolume.value) }
-    var deviceSliderPosition by remember { mutableFloatStateOf(audioStreamer.deviceVolume.value) }
+    LaunchedEffect(Unit) {
+        val activity = context as? MainActivity
+        if (activity?.intent?.action == CastAudioSettings.ACTION_RESUME_AFTER_BOOT) {
+            activity.intent = activity.intent.apply { action = null }
+            audioStreamer.useDeviceAudioOnly()
+            startStreamingAction()
+        }
+    }
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-
         Text(
             text = "Enviar Audio",
-            style = MaterialTheme.typography.labelLarge.copy(
-                fontWeight = FontWeight.Bold,
-                fontSize = 24.sp
-            ),
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            textAlign = TextAlign.Start
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Text(
+            "Envía el audio que reproduce esta tablet al computador.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         Card(
             modifier = Modifier.fillMaxWidth(),
-            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh 
-            )
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
         ) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Microphone")
-                    Switch(
-                        checked = isMicEnabled,
-                        onCheckedChange = { audioStreamer.setMicEnabled(it) },
-                        enabled = !isStreaming
-                    )
-                }
-
-
-                if (isMicEnabled) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Volume_mute,
-                            contentDescription = "Microphone Volume",
-                            tint = MaterialTheme.colorScheme.onSurface
-                        )
-                        Slider(
-                            value = micSliderPosition,
-                            onValueChange = {
-                                micSliderPosition = it
-                                audioStreamer.setMicVolume(it)
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = !isStreaming
-                        )
-                        Icon(
-                            imageVector = Volume_up,
-                            contentDescription = "Microphone Volume Max",
-                            tint = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Device Audio")
-                    Switch(
-                        checked = isDeviceAudioEnabled,
-                        onCheckedChange = { audioStreamer.setDeviceAudioEnabled(it) },
-                        enabled = !isStreaming
-                    )
-                }
-
-
-                if (isDeviceAudioEnabled) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Volume_mute,
-                            contentDescription = "Device Volume Min",
-                            tint = MaterialTheme.colorScheme.onSurface
-                        )
-                        Slider(
-                            value = deviceSliderPosition,
-                            onValueChange = {
-                                deviceSliderPosition = it
-                                audioStreamer.setDeviceVolume(it)
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = !isStreaming
-                        )
-                        Icon(
-                            imageVector = Volume_up,
-                            contentDescription = "Device Volume Max",
-                            tint = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
-                Button(
-                    onClick = {
-                        if (!isStreaming) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                ContextCompat.checkSelfPermission(
-                                    context,
-                                    Manifest.permission.POST_NOTIFICATIONS
-                                ) != PackageManager.PERMISSION_GRANTED
-                            ) {
-                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                            } else {
-                                requestProjection()
-                            }
-                        } else {
-                            audioStreamer.stopStreaming()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = isMicEnabled || isDeviceAudioEnabled
-                ) {
-                    Text(if (isStreaming) "Stop Streaming" else "Start Streaming")
-                }
+                Text("Audio del dispositivo", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "El micrófono está desactivado. El envío de red se detiene cuando hay silencio.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
-        if (connectionStatus.isNotEmpty()) {
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    Text(
-                        connectionStatus,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-            }
-
-
-        }
-
-        Spacer(modifier = Modifier.weight(1f))
-
-        // Download desktop client link
-        TextButton(
-            onClick = {
-                val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://heymeowcat.is-a.dev/SoundDrift-site/#download"))
-                context.startActivity(intent)
-            }
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
         ) {
             Text(
-                "Download Desktop Client",
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.bodyMedium
+                text = if (isStreaming) connectionStatus else "Envío detenido",
+                modifier = Modifier.padding(20.dp),
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (isStreaming) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+
+        Button(
+            onClick = {
+                if (!isStreaming) {
+                    audioStreamer.useDeviceAudioOnly()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        startStreamingAction()
+                    }
+                } else {
+                    audioStreamer.stopStreaming()
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (isStreaming) "Detener envío" else "Iniciar envío")
         }
     }
 }

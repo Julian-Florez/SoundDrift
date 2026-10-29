@@ -16,6 +16,19 @@ class BootReceiver : BroadcastReceiver() {
         val preferences = context.getSharedPreferences(CastAudioSettings.PREFS_NAME, Context.MODE_PRIVATE)
         if (!preferences.getBoolean(CastAudioSettings.RESUME_AFTER_BOOT, false)) return
 
+        val hasPrivilegedCapture = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            "android.permission.CAPTURE_AUDIO_OUTPUT"
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        if (hasPrivilegedCapture) {
+            val serviceIntent = Intent(context, MediaProjectionService::class.java).apply {
+                action = MediaProjectionService.ACTION_START_DIRECT
+            }
+            context.startForegroundService(serviceIntent)
+            return
+        }
+
         val notificationManager = context.getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             notificationManager.createNotificationChannel(
