@@ -45,10 +45,16 @@ class MediaProjectionService : Service() {
     @Volatile private var pcSocket: Socket? = null
     @Volatile private var pcAddress: java.net.InetAddress? = null
     @Volatile private var isPcConnected = false
+    @Volatile private var isScreenOn = true
+    @Volatile private var isSystemAudioPlaying = false
+    @Volatile private var isCaptureActive = false
+    private val captureStateLock = Any()
     private val metadataLock = Any()
+    private val wakeLockLock = Any()
     private var streamingWakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var tcpWriter: PrintWriter? = null
+    private var audioManager: AudioManager? = null
     private var micVolume = 1f
     private var deviceVolume = 1f
     private var connectedClientIP: String = ""
@@ -60,6 +66,32 @@ class MediaProjectionService : Service() {
 
     private val latencyMeasurements = ConcurrentLinkedQueue<Long>()
     private var maxLatency = 0L
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    isScreenOn = true
+                    evaluateCaptureState()
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    isScreenOn = false
+                    isSystemAudioPlaying = audioManager?.isMusicActive == true
+                    evaluateCaptureState()
+                }
+            }
+        }
+    }
+
+    private val audioPlaybackCallback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+            val active = audioManager?.isMusicActive == true
+            if (isSystemAudioPlaying != active) {
+                isSystemAudioPlaying = active
+                evaluateCaptureState()
+            }
+        }
+    }
 
     companion object {
         const val ACTION_STOP = "com.material.castaudio.STOP_STREAMING"
@@ -83,13 +115,13 @@ class MediaProjectionService : Service() {
     fun getIsDeviceAudioEnabled(): Boolean = isDeviceAudioEnabled.get()
     fun setMicEnabled(enabled: Boolean) {
         isMicEnabled.set(enabled)
-        updateAudioRecording()
+        evaluateCaptureState(forceRestart = true)
         sendMetadata()
     }
 
     fun setDeviceAudioEnabled(enabled: Boolean) {
         isDeviceAudioEnabled.set(enabled)
-        updateAudioRecording()
+        evaluateCaptureState(forceRestart = true)
         sendMetadata()
     }
 
@@ -139,12 +171,25 @@ class MediaProjectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        isScreenOn = powerManager.isInteractive
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        isSystemAudioPlaying = audioManager?.isMusicActive == true
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        registerReceiver(screenReceiver, filter)
+        audioManager?.registerAudioPlaybackCallback(audioPlaybackCallback, Handler(Looper.getMainLooper()))
+
         startPcConnectionLoop()
     }
 
     private fun startPcConnectionLoop() {
         if (connectionJob?.isActive == true) return
         connectionJob = serviceScope.launch {
+            var reconnectDelayMs = 2_000L
             while (isActive) {
                 val socket = Socket()
                 try {
@@ -165,12 +210,14 @@ class MediaProjectionService : Service() {
                     connectedClientIP = socket.inetAddress.hostAddress ?: pcHost
                     connectedClientDeviceName = pcHost
                     isPcConnected = true
+                    reconnectDelayMs = 2_000L
                     println("Connected to $pcHost:$pcTcpPort")
+                    evaluateCaptureState()
                     sendMetadata()
                     metadataHeartbeatJob?.cancel()
                     metadataHeartbeatJob = serviceScope.launch {
                         while (isActive && isPcConnected) {
-                            delay(10_000)
+                            delay(30_000)
                             if (isActive && isPcConnected) sendMetadata()
                         }
                     }
@@ -181,11 +228,12 @@ class MediaProjectionService : Service() {
                     }
                     println("PC connection closed")
                 } catch (e: Exception) {
-                    if (isActive) println("PC connection failed: ${e.message}; retrying")
+                    if (isActive) println("PC connection failed: ${e.message}; retrying in ${reconnectDelayMs}ms")
                 } finally {
                     metadataHeartbeatJob?.cancel()
                     metadataHeartbeatJob = null
                     isPcConnected = false
+                    evaluateCaptureState()
                     connectedClientIP = ""
                     connectedClientDeviceName = ""
                     pcAddress = null
@@ -198,7 +246,12 @@ class MediaProjectionService : Service() {
                     if (pcSocket === socket) pcSocket = null
                     runCatching { socket.close() }
                 }
-                delay(2000)
+                delay(reconnectDelayMs)
+                reconnectDelayMs = when {
+                    reconnectDelayMs < 5_000L -> 5_000L
+                    reconnectDelayMs < 15_000L -> 15_000L
+                    else -> 30_000L
+                }
             }
         }
     }
@@ -220,48 +273,61 @@ class MediaProjectionService : Service() {
 
         if (resultCode != 0 && data != null) {
             startForegroundService(useMediaProjection = true)
-            acquireStreamingWakeLock()
             startMediaProjection(resultCode, data)
         } else if (intent?.action == ACTION_START_DIRECT) {
             startForegroundService(useMediaProjection = false)
-            acquireStreamingWakeLock()
             isDeviceAudioEnabled.set(true)
-            updateAudioRecording()
+            evaluateCaptureState()
         } else if (intent?.action != ACTION_STOP) {
             stopSelf()
         }
         return START_STICKY
     }
 
-    private fun acquireStreamingWakeLock() {
-        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        if (streamingWakeLock?.isHeld != true) {
-            streamingWakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "$packageName:AudioStreaming"
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
+    private fun acquireActiveStreamingLocks() {
+        synchronized(wakeLockLock) {
+            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+            if (streamingWakeLock?.isHeld != true) {
+                streamingWakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "$packageName:AudioStreaming"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+
+            if (wifiLock?.isHeld != true) {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    wifiManager.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                        "$packageName:AudioLowLatency"
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    wifiManager.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                        "$packageName:AudioHighPerf"
+                    )
+                }.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
             }
         }
+    }
 
-        if (wifiLock?.isHeld != true) {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                wifiManager.createWifiLock(
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-                    "$packageName:AudioLowLatency"
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                wifiManager.createWifiLock(
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                    "$packageName:AudioHighPerf"
-                )
-            }.apply {
-                setReferenceCounted(false)
-                acquire()
+    private fun releaseActiveStreamingLocks() {
+        synchronized(wakeLockLock) {
+            streamingWakeLock?.let { lock ->
+                if (lock.isHeld) lock.release()
             }
+            streamingWakeLock = null
+            wifiLock?.let { lock ->
+                if (lock.isHeld) lock.release()
+            }
+            wifiLock = null
         }
     }
 
@@ -323,6 +389,27 @@ class MediaProjectionService : Service() {
         manager.createNotificationChannel(serviceChannel)
     }
 
+    private fun evaluateCaptureState(forceRestart: Boolean = false) {
+        val shouldCapture = isPcConnected && (
+            isMicEnabled.get() ||
+                (isDeviceAudioEnabled.get() && (isScreenOn || isSystemAudioPlaying))
+            )
+        synchronized(captureStateLock) {
+            if (!shouldCapture) {
+                if (isCaptureActive || forceRestart) {
+                    isCaptureActive = false
+                    stopAudioRecording()
+                    releaseActiveStreamingLocks()
+                }
+                return
+            }
+            if (!isCaptureActive || forceRestart) {
+                isCaptureActive = true
+                updateAudioRecording()
+            }
+        }
+    }
+
     private fun updateAudioRecording() {
         stopAudioRecording()
         if (isMicEnabled.get() || isDeviceAudioEnabled.get()) {
@@ -344,6 +431,8 @@ class MediaProjectionService : Service() {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             val buffer = ByteArray(packetChunkSize)
             val mixBuffer = ByteArray(packetChunkSize)
+            var lastAudibleElapsed = 0L
+            var locksHeld = false
 
             try {
                 while (isActive) {
@@ -376,26 +465,48 @@ class MediaProjectionService : Service() {
                         }
                     }
 
+                    val nowElapsed = SystemClock.elapsedRealtime()
                     if (totalSize > 0 && isPcConnected) {
-                        try {
-                            val targetAddress = pcAddress
-                            val socket = audioSocket
-                            if (isPcConnected && targetAddress != null && socket != null) {
-                                socket.send(DatagramPacket(mixBuffer, totalSize, targetAddress, pcUdpPort))
-                                lastPacketTime.set(System.currentTimeMillis())
-                            }
-
-                            val endTime = System.nanoTime()
-                            val latency = (endTime - startTime) / 1_000_000
-                            updateLatencyMetrics(latency)
-                        } catch (e: Exception) {
-                            println("Error sending audio packet: ${e.message}")
+                        val audible = hasAudiblePcm(mixBuffer, totalSize)
+                        if (audible) {
+                            lastAudibleElapsed = nowElapsed
                         }
+                        val withinHangover = lastAudibleElapsed > 0L && (nowElapsed - lastAudibleElapsed) <= 500L
+                        if (audible || withinHangover) {
+                            if (!locksHeld) {
+                                acquireActiveStreamingLocks()
+                                locksHeld = true
+                            }
+                            try {
+                                val targetAddress = pcAddress
+                                val socket = audioSocket
+                                if (isPcConnected && targetAddress != null && socket != null) {
+                                    socket.send(DatagramPacket(mixBuffer, totalSize, targetAddress, pcUdpPort))
+                                    lastPacketTime.set(System.currentTimeMillis())
+                                }
+
+                                val endTime = System.nanoTime()
+                                val latency = (endTime - startTime) / 1_000_000
+                                updateLatencyMetrics(latency)
+                            } catch (e: Exception) {
+                                println("Error sending audio packet: ${e.message}")
+                            }
+                        } else if (locksHeld && lastAudibleElapsed > 0L && (nowElapsed - lastAudibleElapsed) > 2_000L) {
+                            releaseActiveStreamingLocks()
+                            locksHeld = false
+                        }
+                    } else if (locksHeld && (lastAudibleElapsed == 0L || (nowElapsed - lastAudibleElapsed) > 2_000L)) {
+                        releaseActiveStreamingLocks()
+                        locksHeld = false
                     }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
                 connectedClientIP = ""
+            } finally {
+                if (locksHeld) {
+                    releaseActiveStreamingLocks()
+                }
             }
         }
     }
@@ -600,11 +711,14 @@ class MediaProjectionService : Service() {
     }
 
     override fun onDestroy() {
+        runCatching { unregisterReceiver(screenReceiver) }
+        runCatching { audioManager?.unregisterAudioPlaybackCallback(audioPlaybackCallback) }
         connectionJob?.cancel()
         metadataHeartbeatJob?.cancel()
         serviceScope.cancel()
         isMicEnabled.set(false)
         isDeviceAudioEnabled.set(false)
+        isCaptureActive = false
         stopAudioRecording()
         mediaProjection?.stop()
         mediaProjection = null
@@ -618,14 +732,7 @@ class MediaProjectionService : Service() {
             tcpWriter = null
         }
         pcAddress = null
-        streamingWakeLock?.let { lock ->
-            if (lock.isHeld) lock.release()
-        }
-        streamingWakeLock = null
-        wifiLock?.let { lock ->
-            if (lock.isHeld) lock.release()
-        }
-        wifiLock = null
+        releaseActiveStreamingLocks()
         latencyMeasurements.clear()
         super.onDestroy()
     }
